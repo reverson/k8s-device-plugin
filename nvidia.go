@@ -3,20 +3,28 @@
 package main
 
 import (
-	"strings"
+	"log"
 
-	"github.com/NVIDIA/nvidia-docker/src/nvidia"
 	"github.com/NVIDIA/nvidia-docker/src/nvml"
 
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha1"
+	"golang.org/x/net/context"
+	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha"
 )
 
+func check(err error) {
+	if err != nil {
+		log.Panicln("Fatal:", err)
+	}
+}
+
 func getDevices() []*pluginapi.Device {
-	nvdevs, err := nvidia.LookupDevices()
+	n, err := nvml.GetDeviceCount()
 	check(err)
 
 	var devs []*pluginapi.Device
-	for _, d := range nvdevs {
+	for i := uint(0); i < n; i++ {
+		d, err := nvml.NewDeviceLite(i)
+		check(err)
 		devs = append(devs, &pluginapi.Device{
 			ID:     d.UUID,
 			Health: pluginapi.Healthy,
@@ -35,25 +43,44 @@ func deviceExists(devs []*pluginapi.Device, id string) bool {
 	return false
 }
 
-func checkXIDs(xidEventSet nvml.EventSet, devs []*pluginapi.Device) bool {
-	e, err := nvml.WaitForEvent(xidEventSet, 5000)
-	if err != nil && strings.Contains(err.Error(), "Timeout") {
-		return true
-	}
+func watchXIDs(ctx context.Context, devs []*pluginapi.Device, xids chan<- *pluginapi.Device) {
+	eventSet := nvml.NewEventSet()
+	defer nvml.DeleteEventSet(eventSet)
 
-	if e.UUID == nil || len(*e.UUID) == 0 {
+	err := nvml.RegisterEvent(eventSet, nvml.XidCriticalError)
+	check(err)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		e, err := nvml.WaitForEvent(eventSet, 5000)
+		if err != nil && e.Etype != nvml.XidCriticalError {
+			continue
+		}
+
+		// FIXME: formalize the full list and document it.
+		// http://docs.nvidia.com/deploy/xid-errors/index.html#topic_4
+		// Application errors: the GPU should still be healthy
+		if e.Edata == 31 || e.Edata == 43 || e.Edata == 45 {
+			continue
+		}
+
+		if e.UUID == nil || len(*e.UUID) == 0 {
+			// All devices are unhealthy
+			for _, d := range devs {
+				xids <- d
+			}
+			continue
+		}
+
 		for _, d := range devs {
-			d.Health = pluginapi.Unhealthy
-		}
-		return false
-	}
-
-	for _, d := range devs {
-		if d.ID == *e.UUID {
-			d.Health = pluginapi.Unhealthy
-			break
+			if d.ID == *e.UUID {
+				xids <- d
+			}
 		}
 	}
-
-	return false
 }

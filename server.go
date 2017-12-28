@@ -11,10 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvidia-docker/src/nvml"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha1"
+	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha"
 )
 
 const (
@@ -22,25 +21,42 @@ const (
 	serverSock   = pluginapi.DevicePluginPath + "nvidia.sock"
 )
 
+// NvidiaDevicePlugin implements the Kubernetes device plugin API
 type NvidiaDevicePlugin struct {
 	devs   []*pluginapi.Device
 	socket string
 
 	stop   chan interface{}
-	update chan []*pluginapi.Device
+	health chan *pluginapi.Device
 
 	server *grpc.Server
 }
 
-// NewNvidiaDevicePlugin returns an initialized NvidiaDevicePlugin.
+// NewNvidiaDevicePlugin returns an initialized NvidiaDevicePlugin
 func NewNvidiaDevicePlugin() *NvidiaDevicePlugin {
 	return &NvidiaDevicePlugin{
 		devs:   getDevices(),
 		socket: serverSock,
 
 		stop:   make(chan interface{}),
-		update: make(chan []*pluginapi.Device),
+		health: make(chan *pluginapi.Device),
 	}
+}
+
+// dial establishes the gRPC communication with the registered device plugin.
+func dial(unixSocketPath string, timeout time.Duration) (*grpc.ClientConn, error) {
+	c, err := grpc.Dial(unixSocketPath, grpc.WithInsecure(), grpc.WithBlock(),
+		grpc.WithTimeout(timeout),
+		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout("unix", addr, timeout)
+		}),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
 }
 
 // Start starts the gRPC server of the device plugin
@@ -59,15 +75,15 @@ func (m *NvidiaDevicePlugin) Start() error {
 	pluginapi.RegisterDevicePluginServer(m.server, m)
 
 	go m.server.Serve(sock)
-	// Wait till grpc server is ready.
-	for i := 0; i < 10; i++ {
-		services := m.server.GetServiceInfo()
-		if len(services) > 1 {
-			break
-		}
-		time.Sleep(1 * time.Second)
+
+	// Wait for server to start by launching a blocking connexion
+	conn, err := dial(m.socket, 5*time.Second)
+	if err != nil {
+		return err
 	}
-	go m.HealthCheck()
+	conn.Close()
+
+	go m.healthcheck()
 
 	return nil
 }
@@ -87,14 +103,12 @@ func (m *NvidiaDevicePlugin) Stop() error {
 
 // Register registers the device plugin for the given resourceName with Kubelet.
 func (m *NvidiaDevicePlugin) Register(kubeletEndpoint, resourceName string) error {
-	conn, err := grpc.Dial(kubeletEndpoint, grpc.WithInsecure(),
-		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout("unix", addr, timeout)
-		}))
-	defer conn.Close()
+	conn, err := dial(kubeletEndpoint, 5*time.Second)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
+
 	client := pluginapi.NewRegistrationClient(conn)
 	reqt := &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
@@ -109,7 +123,7 @@ func (m *NvidiaDevicePlugin) Register(kubeletEndpoint, resourceName string) erro
 	return nil
 }
 
-// ListAndWatch lists devices and update that list according to the Update call
+// ListAndWatch lists devices and update that list according to the health status
 func (m *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 	s.Send(&pluginapi.ListAndWatchResponse{Devices: m.devs})
 
@@ -117,39 +131,31 @@ func (m *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Device
 		select {
 		case <-m.stop:
 			return nil
-		case updated := <-m.update:
-			// FIXME: submit upstream patch.
-			m.devs = updated
+		case d := <-m.health:
+			// FIXME: there is no way to recover from the Unhealthy state.
+			d.Health = pluginapi.Unhealthy
 			s.Send(&pluginapi.ListAndWatchResponse{Devices: m.devs})
 		}
 	}
 }
 
-// Update allows the device plugin to send new devices through ListAndWatch
-func (m *NvidiaDevicePlugin) Update(devs []*pluginapi.Device) {
-	m.update <- devs
+func (m *NvidiaDevicePlugin) unhealthy(dev *pluginapi.Device) {
+	m.health <- dev
 }
 
 // Allocate which return list of devices.
 func (m *NvidiaDevicePlugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	devs := m.devs
-	var response pluginapi.AllocateResponse
+	response := pluginapi.AllocateResponse{
+		Envs: map[string]string{
+			"NVIDIA_VISIBLE_DEVICES": strings.Join(r.DevicesIDs, ","),
+		},
+	}
 
-	for i, id := range r.DevicesIDs {
+	for _, id := range r.DevicesIDs {
 		if !deviceExists(devs, id) {
-			return nil, fmt.Errorf("Invalid allocation request: unknown device: %s", id)
+			return nil, fmt.Errorf("invalid allocation request: unknown device: %s", id)
 		}
-
-		devRuntime := new(pluginapi.DeviceRuntimeSpec)
-		devRuntime.ID = id
-		// Only add env vars to the first device.
-		// Will be fixed by: https://github.com/kubernetes/kubernetes/pull/53031
-		if i == 0 {
-			devRuntime.Envs = make(map[string]string)
-			devRuntime.Envs["NVIDIA_VISIBLE_DEVICES"] = strings.Join(r.DevicesIDs, ",")
-		}
-
-		response.Spec = append(response.Spec, devRuntime)
 	}
 
 	return &response, nil
@@ -163,28 +169,24 @@ func (m *NvidiaDevicePlugin) cleanup() error {
 	return nil
 }
 
-func (m *NvidiaDevicePlugin) HealthCheck() {
-	eventSet := nvml.NewEventSet()
-	defer nvml.DeleteEventSet(eventSet)
+func (m *NvidiaDevicePlugin) healthcheck() {
+	ctx, cancel := context.WithCancel(context.Background())
 
-	err := nvml.RegisterEvent(eventSet, nvml.XidCriticalError)
-	check(err)
+	xids := make(chan *pluginapi.Device)
+	go watchXIDs(ctx, m.devs, xids)
 
 	for {
 		select {
 		case <-m.stop:
+			cancel()
 			return
-		default:
-			// FIXME: there is a race condition if another goroutine calls m.Update concurrently.
-			devs := m.devs
-			healthy := checkXIDs(eventSet, devs)
-			if !healthy {
-				m.Update(devs)
-			}
+		case dev := <-xids:
+			m.unhealthy(dev)
 		}
 	}
 }
 
+// Serve starts the gRPC server and register the device plugin to Kubelet
 func (m *NvidiaDevicePlugin) Serve() error {
 	err := m.Start()
 	if err != nil {

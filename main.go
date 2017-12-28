@@ -5,87 +5,76 @@ package main
 import (
 	"log"
 	"os"
-	"os/signal"
-	"runtime"
-	"runtime/debug"
 	"syscall"
 
-	"github.com/NVIDIA/nvidia-docker/src/nvidia"
+	"github.com/NVIDIA/nvidia-docker/src/nvml"
 	"github.com/fsnotify/fsnotify"
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha1"
+	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha"
 )
 
-func check(err error) {
-	if err != nil {
-		log.Panicln("Fatal:", err)
-	}
-}
-
-func exit() {
-	if err := recover(); err != nil {
-		if _, ok := err.(runtime.Error); ok {
-			log.Println(err)
-		}
-		if os.Getenv("NV_DEBUG") != "" {
-			log.Printf("%s", debug.Stack())
-		}
+func main() {
+	log.Println("Loading NVML")
+	if err := nvml.Init(); err != nil {
+		log.Printf("Failed to start nvml with error: %s.", err)
 		os.Exit(1)
 	}
+	defer func() { log.Println("Shutdown of NVML returned:", nvml.Shutdown()) }()
 
-	os.Exit(0)
-}
-
-func main() {
-	defer exit()
-
-	log.Println("Loading NVIDIA management library")
-	check(nvidia.Init())
-	defer func() { check(nvidia.Shutdown()) }()
-
-	// Should it be in the device plugin Serve?
+	log.Println("Fetching devices.")
 	if len(getDevices()) == 0 {
-		log.Println("No devices found. Looping")
+		log.Println("No devices found. Waiting indefinitely.")
 		select {}
 	}
 
-	devicePlugin := NewNvidiaDevicePlugin()
-	devicePlugin.Serve()
-
-	watcher, err := fsnotify.NewWatcher()
-	check(err)
+	log.Println("Starting FS watcher.")
+	watcher, err := newFSWatcher(pluginapi.DevicePluginPath)
+	if err != nil {
+		log.Println("Failed to created FS watcher.")
+		os.Exit(1)
+	}
 	defer watcher.Close()
-	err = watcher.Add(pluginapi.DevicePluginPath)
-	check(err)
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	log.Println("Starting OS watcher.")
+	sigs := newOSWatcher(syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+	restart := true
+	var devicePlugin *NvidiaDevicePlugin
 
 L:
 	for {
-		restart := false
+		if restart {
+			if devicePlugin != nil {
+				devicePlugin.Stop()
+			}
+
+			devicePlugin = NewNvidiaDevicePlugin()
+			if err := devicePlugin.Serve(); err != nil {
+				log.Println("Could not contact Kubelet, retrying. Did you enable the device plugin feature gate?")
+			} else {
+				restart = false
+			}
+		}
+
 		select {
 		case event := <-watcher.Events:
 			if event.Name == pluginapi.KubeletSocket && event.Op&fsnotify.Create == fsnotify.Create {
-				log.Printf("inotify: %s created, restarting", pluginapi.KubeletSocket)
+				log.Printf("inotify: %s created, restarting.", pluginapi.KubeletSocket)
 				restart = true
 			}
+
 		case err := <-watcher.Errors:
 			log.Printf("inotify: %s", err)
+
 		case s := <-sigs:
 			switch s {
 			case syscall.SIGHUP:
-				log.Println("Received SIGHUP, restarting")
+				log.Println("Received SIGHUP, restarting.")
 				restart = true
 			default:
-				log.Printf("Received signal %d, shutting down", s)
+				log.Printf("Received signal \"%v\", shutting down.", s)
 				devicePlugin.Stop()
 				break L
 			}
-		}
-		if restart {
-			devicePlugin.Stop()
-			devicePlugin = NewNvidiaDevicePlugin()
-			devicePlugin.Serve()
 		}
 	}
 }

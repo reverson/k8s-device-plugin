@@ -4,6 +4,8 @@ package main
 
 import (
 	"log"
+	"os"
+	"strings"
 
 	"github.com/NVIDIA/nvidia-docker/src/nvml"
 
@@ -23,12 +25,22 @@ func getDevices() []*pluginapi.Device {
 
 	var devs []*pluginapi.Device
 	for i := uint(0); i < n; i++ {
-		d, err := nvml.NewDeviceLite(i)
+		d, err := nvml.NewDevice(i)
 		check(err)
-		devs = append(devs, &pluginapi.Device{
-			ID:     d.UUID,
-			Health: pluginapi.Healthy,
-		})
+		if strings.ToLower(os.Getenv("REGISTER_MEMORY")) == "true" {
+			mem := d.PCI.BAR1
+			for j := uint64(0); j < *mem; j++ {
+				devs = append(devs, &pluginapi.Device{
+					ID:     d.UUID,
+					Health: pluginapi.Healthy,
+				})
+			}
+		} else {
+			devs = append(devs, &pluginapi.Device{
+				ID:     d.UUID,
+				Health: pluginapi.Healthy,
+			})
+		}
 	}
 
 	return devs
